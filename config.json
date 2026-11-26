@@ -1,0 +1,24 @@
+{
+  "channel_link": "https://t.me/+PV1yox-rEZE5NjZk",
+  "admin_id": 7762361047,
+  "cards": [
+    {
+      "number": "6219861804814316",
+      "holder": "محمدعلی بهره بر"
+    },
+    {
+      "number": "6037701902347183",
+      "holder": "محمدعلی بهره بر"
+    }
+  ],
+  "initial_round": {
+    "title": "دوره اول",
+    "capacity": 2000,
+    "base_amount_toman": 15000000
+  },
+  "random_non_round_extra_toman": {
+    "min": 1001,
+    "max": 999997
+  },
+  "report_every_codes": 2000
+}

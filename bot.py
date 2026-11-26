@@ -1,233 +1,318 @@
-import os
-import re
-import sqlite3
-import secrets
-import string
-from datetime import datetime, timezone
+import os, re, sqlite3, random, secrets, io
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ContextTypes, filters
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7762361047"))
+DB = os.getenv("DB_PATH", "raffle.sqlite3")
+CHANNEL_LINK = "https://t.me/+PV1yox-rEZE5NjZk"
+CARDS = [
+    ("6219861804814316", "محمدعلی بهره بر"),
+    ("6037701902347183", "محمدعلی بهره بر"),
+]
+DEFAULT_CAPACITY = 2000
+DEFAULT_PRICE = 15000000  # مبلغ پایه سفارش به تومان؛ پیش از اجرا حتماً در config بررسی شود
+REPORT_EVERY = 2000
 
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-BASE_PRICE = int(os.getenv("BASE_PRICE", "100000"))
-DB_PATH = os.getenv("DB_PATH", "raffle.sqlite3")
+def conn():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
-if not TOKEN:
-    raise RuntimeError("Set BOT_TOKEN in environment variables.")
-if not ADMIN_ID:
-    raise RuntimeError("Set ADMIN_ID (your numeric Telegram user ID).")
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+def money(n):
+    return f"{int(n):,}"
 
 def init_db():
-    with db() as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            quantity INTEGER NOT NULL,
-            amount INTEGER NOT NULL UNIQUE,
-            status TEXT NOT NULL DEFAULT 'awaiting_receipt',
-            receipt_file_id TEXT,
-            created_at TEXT NOT NULL
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            code TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL
-        )""")
+    with conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS rounds(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+            capacity INTEGER NOT NULL, base_amount INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL, username TEXT, full_name TEXT NOT NULL,
+            phone TEXT NOT NULL, quantity INTEGER NOT NULL, amount INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL, created_at TEXT NOT NULL, receipt_file_id TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS tickets(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL,
+            order_id INTEGER NOT NULL, code TEXT NOT NULL,
+            user_id INTEGER NOT NULL, full_name TEXT NOT NULL, phone TEXT NOT NULL,
+            created_at TEXT NOT NULL, UNIQUE(round_id, code))""")
+        if not c.execute("SELECT id FROM rounds LIMIT 1").fetchone():
+            c.execute("INSERT INTO rounds(title,capacity,base_amount,active,created_at) VALUES(?,?,?,?,?)",
+                      ("دوره اول", DEFAULT_CAPACITY, DEFAULT_PRICE, 1, now()))
 
-def make_code():
-    alphabet = string.ascii_uppercase + string.digits
-    return "RAFFLE-" + "".join(secrets.choice(alphabet) for _ in range(10))
+def active_round():
+    with conn() as c:
+        return c.execute("SELECT * FROM rounds WHERE active=1 ORDER BY id DESC LIMIT 1").fetchone()
 
-def new_amount(con):
-    # Unique, non-rounded amount: base price per ticket + a small unique suffix.
-    # The customer must transfer the exact displayed total.
-    while True:
-        suffix = secrets.randbelow(999) + 1
-        amount = BASE_PRICE + suffix
-        if not con.execute("SELECT 1 FROM orders WHERE amount=?", (amount,)).fetchone():
-            return amount
+def round_count(rid):
+    with conn() as c:
+        return c.execute("SELECT COUNT(*) n FROM tickets WHERE round_id=?", (rid,)).fetchone()["n"]
+
+def fmt_round(r):
+    return f"🎁 {r['title']}\\nظرفیت: {r['capacity']:,}\\nکد صادرشده: {round_count(r['id']):,}\\nباقی‌مانده: {max(0,r['capacity']-round_count(r['id'])):,}"
+
+def amount_for(base):
+    # مبلغ اختصاصی و غیررُند برای شناسایی آسان‌تر واریزی
+    with conn() as c:
+        while True:
+            amount = base + random.randint(1001, 999997)
+            if amount % 1000 and not c.execute("SELECT 1 FROM orders WHERE amount=?", (amount,)).fetchone():
+                return amount
+
+def unique_code(rid):
+    with conn() as c:
+        while True:
+            code = f"{random.randint(0,9999):04d}"
+            if not c.execute("SELECT 1 FROM tickets WHERE round_id=? AND code=?", (rid,code)).fetchone():
+                return code
+
+def intro_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ موافقم و ادامه می‌دهم", callback_data="agree")],
+        [InlineKeyboardButton("📣 مشاهده کانال قرعه‌کشی", url=CHANNEL_LINK)]
+    ])
+
+WELCOME = (
+    "🎉 به جشنواره قرعه‌کشی خوش آمدید 🎉\\n\\n"
+    "شرکت در این قرعه‌کشی کاملاً اختیاری می‌باشد.\\n\\n"
+    "🔒 حریم خصوصی: نام، شماره تماس و اطلاعات واریزی شما فقط برای همین جشنواره استفاده می‌شود و در اختیار کسی قرار نمی‌گیرد.\\n\\n"
+    "با زدن دکمه زیر موافقت خود را اعلام می‌کنید.\\n\\n"
+    "برای شرکت، دکمه «خرید کد» را بزنید. ابتدا نام و نام خانوادگی و شماره همراه صاحب رسید از شما پرسیده می‌شود و سپس مراحل بعدی انجام می‌گیرد.\\n\\n"
+    f"📣 کانال قرعه‌کشی:\\n{CHANNEL_LINK}\\n\\n"
+    "📢 با توجه به حجم بالای ورودی، پردازش هر واریز ممکن است چند دقیقه طول بکشد. پس از اعلام ثبت رسید، نیازی به ارسال دوباره نیست."
+)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "سلام! به سامانه ثبت‌نام قرعه‌کشی خوش آمدید.\\n"
-        "برای شروع ثبت سفارش، /buy را بزنید.\\n"
-        "پس از ثبت سفارش، رسید پرداخت را همین‌جا به‌صورت عکس ارسال کنید."
-    )
+    context.user_data.clear()
+    r = active_round()
+    extra = "\\n\\n" + fmt_round(r) if r else "\\n\\nفعلاً دوره فعالی وجود ندارد."
+    await update.message.reply_text(WELCOME + extra, reply_markup=intro_kb())
+
+async def agree(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text("برای ثبت‌نام و خرید کد، دکمه زیر را انتخاب کنید.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎟 خرید کد", callback_data="buy")]]))
 
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"قیمت پایه هر کد: {BASE_PRICE:,} تومان\\n"
-        "تعداد کد موردنظر را به‌صورت عددی بفرستید (حداکثر ۲۰)."
-    )
-    context.user_data["waiting_quantity"] = True
-
-async def handle_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("waiting_quantity"):
+    q = update.callback_query
+    await q.answer()
+    r = active_round()
+    if not r or round_count(r["id"]) >= r["capacity"]:
+        await q.message.reply_text("ظرفیت این دوره تکمیل شده یا دوره فعالی وجود ندارد.")
         return
-    raw = (update.message.text or "").strip()
-    if not raw.isdigit() or not 1 <= int(raw) <= 20:
-        await update.message.reply_text("لطفاً عددی بین ۱ تا ۲۰ بفرستید.")
-        return
+    context.user_data.clear()
+    context.user_data.update(step="name", round_id=r["id"])
+    await q.message.reply_text("✍️ لطفاً نام و نام خانوادگی صاحب رسید را وارد کنید.")
 
-    quantity = int(raw)
-    context.user_data["waiting_quantity"] = False
-    user = update.effective_user
+async def ask_phone(update, context):
+    context.user_data["step"] = "phone"
+    kb = ReplyKeyboardMarkup([[KeyboardButton("📱 ارسال شماره همراه من", request_contact=True)]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text("📱 شماره همراه را با دکمه زیر ارسال کنید (یا شماره را دستی بنویسید).",
+                                    reply_markup=kb)
 
-    with db() as con:
-        amount = new_amount(con)
-        cur = con.execute(
-            """INSERT INTO orders
-            (user_id, username, quantity, amount, status, created_at)
-            VALUES (?, ?, ?, ?, 'awaiting_receipt', ?)""",
-            (user.id, user.username or "", quantity, amount,
-             datetime.now(timezone.utc).isoformat())
-        )
-        order_id = cur.lastrowid
-
-    context.user_data["current_order_id"] = order_id
-    await update.message.reply_text(
-        f"سفارش شماره #{order_id}\\n"
-        f"تعداد کد: {quantity}\\n"
-        f"مبلغ دقیق قابل واریز: {amount:,} تومان\\n\\n"
-        "پس از واریز، تصویر رسید را همین‌جا ارسال کنید. "
-        "کدها فقط پس از بررسی و تأیید مدیر صادر می‌شوند.\\n\\n"
-        "توجه: این ربات پرداخت بانکی را خودکار بررسی نمی‌کند؛ "
-        "رسید باید با تراکنش واقعی تطبیق داده شود."
-    )
-
-async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo
-    if not photo:
-        return
-    user_id = update.effective_user.id
-    file_id = photo[-1].file_id
-
-    with db() as con:
-        order = con.execute(
-            """SELECT * FROM orders WHERE user_id=?
-            AND status='awaiting_receipt' ORDER BY id DESC LIMIT 1""",
-            (user_id,)
-        ).fetchone()
-        if not order:
-            await update.message.reply_text("سفارشِ منتظر رسید پیدا نشد. ابتدا /buy را بزنید.")
+async def make_order(update, context, phone):
+    r_id = context.user_data.get("round_id")
+    with conn() as c:
+        r = c.execute("SELECT * FROM rounds WHERE id=?", (r_id,)).fetchone()
+        if not r or not r["active"]:
+            await update.message.reply_text("این دوره دیگر فعال نیست. /start را بزنید.")
+            context.user_data.clear()
             return
-        con.execute(
-            "UPDATE orders SET receipt_file_id=?, status='pending_review' WHERE id=?",
-            (file_id, order["id"])
-        )
+        sold = c.execute("SELECT COUNT(*) n FROM tickets WHERE round_id=?", (r_id,)).fetchone()["n"]
+        pending = c.execute("SELECT COALESCE(SUM(quantity),0) n FROM orders WHERE round_id=? AND status IN ('awaiting_receipt','pending_admin')", (r_id,)).fetchone()["n"]
+        available = r["capacity"] - sold - pending
+        qty = context.user_data["quantity"]
+        if qty > available:
+            await update.message.reply_text(f"ظرفیت باقی‌مانده برای سفارش جدید: {max(0,available)}")
+            return
+        amount = amount_for(r["base_amount"])
+        cur = c.execute("""INSERT INTO orders(round_id,user_id,username,full_name,phone,quantity,amount,status,created_at)
+            VALUES(?,?,?,?,?,?,?,'awaiting_receipt',?)""",
+            (r_id, update.effective_user.id, update.effective_user.username or "",
+             context.user_data["full_name"], phone, qty, amount, now()))
+        oid = cur.lastrowid
+    name = context.user_data["full_name"]
+    context.user_data.clear()
+    cards = "\\n\\n".join(f"{i}. {holder}\\n{card}" for i,(card,holder) in enumerate(CARDS,1))
+    msg = (f"💳 مبلغ پرداخت شما — {r['title']}\\n\\nکارت‌های مقصد:\\n{cards}\\n\\n"
+           f"💰 مبلغ: {money(amount)} تومان\\n🎟 تعداد شانس: {qty}\\n"
+           "⏳ مهلت پرداخت: تا پایان دوره\\n\\n"
+           "⚠️ مبلغ را دقیقاً به یکی از کارت‌های بالا واریز کنید.\\n"
+           "پس از واریز، تصویر رسید را همین‌جا ارسال کنید. خرید فقط پس از تأیید مدیریت نهایی می‌شود.")
+    await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(f"📋 کپی مبلغ پرداخت:\\n{amount}", reply_markup=ReplyKeyboardRemove())
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("تأیید و صدور کد", callback_data=f"approve:{order['id']}"),
-        InlineKeyboardButton("رد رسید", callback_data=f"reject:{order['id']}")
-    ]])
-    caption = (
-        f"رسید سفارش #{order['id']}\\n"
-        f"کاربر: {user_id} (@{update.effective_user.username or 'بدون‌نام'})\\n"
-        f"تعداد: {order['quantity']}\\n"
-        f"مبلغ مورد انتظار: {order['amount']:,} تومان"
-    )
-    await context.bot.send_photo(
-        chat_id=ADMIN_ID, photo=file_id, caption=caption, reply_markup=keyboard
-    )
-    await update.message.reply_text("رسید دریافت شد و برای بررسی مدیر ارسال شد.")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get("step")
+    val = (update.message.text or "").strip()
+    if step == "name":
+        if len(val) < 3:
+            await update.message.reply_text("نام و نام خانوادگی را کامل وارد کنید.")
+            return
+        context.user_data["full_name"] = val
+        context.user_data["step"] = "quantity"
+        await update.message.reply_text("🎟 چند کد می‌خواهید؟ تعداد را به عدد وارد کنید.")
+    elif step == "quantity":
+        if not val.isdigit() or not 1 <= int(val) <= 2000:
+            await update.message.reply_text("تعداد باید عددی بین ۱ تا ۲۰۰۰ باشد.")
+            return
+        context.user_data["quantity"] = int(val)
+        await ask_phone(update, context)
+    elif step == "phone":
+        phone = re.sub(r"\\D", "", val)
+        if len(phone) < 10:
+            await update.message.reply_text("شماره همراه معتبر وارد کنید.")
+            return
+        await make_order(update, context, phone)
+    else:
+        await update.message.reply_text("برای شروع /start را بزنید.")
+
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("step") != "phone":
+        return
+    contact = update.message.contact
+    if contact.user_id and contact.user_id != update.effective_user.id:
+        await update.message.reply_text("لطفاً شماره تماس خودتان را ارسال کنید.")
+        return
+    await make_order(update, context, re.sub(r"\\D", "", contact.phone_number))
+
+async def receipt_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    photo = update.message.photo[-1]
+    with conn() as c:
+        order = c.execute("SELECT * FROM orders WHERE user_id=? AND status='awaiting_receipt' ORDER BY id DESC LIMIT 1", (user.id,)).fetchone()
+        if not order:
+            await update.message.reply_text("سفارش در انتظار رسید پیدا نشد. برای شروع /start را بزنید.")
+            return
+        c.execute("UPDATE orders SET status='pending_admin',receipt_file_id=? WHERE id=?", (photo.file_id,order["id"]))
+    cap = (f"🧾 رسید سفارش #{order['id']}\\nدوره: {order['round_id']}\\nنام: {order['full_name']}\\n"
+           f"موبایل: {order['phone']}\\nتعداد کد: {order['quantity']}\\nمبلغ مورد انتظار: {money(order['amount'])} تومان\\n"
+           f"شناسه تلگرام: {user.id}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید پرداخت و صدور کد",callback_data=f"approve:{order['id']}"),
+                                InlineKeyboardButton("❌ رد رسید",callback_data=f"reject:{order['id']}")]])
+    await context.bot.send_photo(ADMIN_ID, photo.file_id, caption=cap, reply_markup=kb)
+    await update.message.reply_text("⏳ رسید برای مدیریت ارسال شد. پس از بررسی، نتیجه اعلام می‌شود.")
+
+def create_pdf(rid):
+    path = f"tickets_round_{rid}.pdf"
+    with conn() as c:
+        r = c.execute("SELECT * FROM rounds WHERE id=?", (rid,)).fetchone()
+        rows = c.execute("SELECT code,full_name,phone,created_at FROM tickets WHERE round_id=? ORDER BY id", (rid,)).fetchall()
+    cv = canvas.Canvas(path, pagesize=A4)
+    w,h = A4
+    cv.setFont("Helvetica", 9)
+    y = h-40
+    cv.drawString(35,y, f"Raffle report | Round: {rid} | {len(rows)} tickets")
+    y -= 24
+    for x in rows:
+        line = f"Code: {x['code']} | Name: {x['full_name']} | Phone: {x['phone']} | {x['created_at']}"
+        cv.drawString(35,y,line[:130])
+        y -= 14
+        if y < 35:
+            cv.showPage(); cv.setFont("Helvetica",9); y=h-40
+    cv.save()
+    return path
 
 async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
-        await query.edit_message_caption("این عملیات فقط برای مدیر مجاز است.")
-        return
-
-    action, order_id_text = query.data.split(":")
-    order_id = int(order_id_text)
-
-    with db() as con:
-        order = con.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not order or order["status"] != "pending_review":
-            await query.edit_message_caption("این سفارش قبلاً بررسی شده یا وجود ندارد.")
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("اجازه دسترسی ندارید.", show_alert=True); return
+    await q.answer()
+    action, oid = q.data.split(":"); oid = int(oid)
+    with conn() as c:
+        order = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not order or order["status"] != "pending_admin":
+            await q.edit_message_caption((q.message.caption or "") + "\\nقبلاً بررسی شده است.")
             return
-
         if action == "reject":
-            con.execute("UPDATE orders SET status='rejected' WHERE id=?", (order_id,))
-            await context.bot.send_message(
-                order["user_id"],
-                f"رسید سفارش #{order_id} تأیید نشد. برای راهنمایی با مدیر تماس بگیرید."
-            )
-            await query.edit_message_caption((query.message.caption or "") + "\\n\\nوضعیت: رد شد")
+            c.execute("UPDATE orders SET status='rejected' WHERE id=?", (oid,))
+            await context.bot.send_message(order["user_id"], "❌ رسید شما تأیید نشد. برای پیگیری با مدیریت تماس بگیرید.")
+            await q.edit_message_caption((q.message.caption or "") + "\\n❌ رد شد.")
             return
+        used = c.execute("SELECT COUNT(*) n FROM tickets WHERE round_id=?", (order["round_id"],)).fetchone()["n"]
+        r = c.execute("SELECT capacity FROM rounds WHERE id=?", (order["round_id"],)).fetchone()
+        if used + order["quantity"] > r["capacity"]:
+            await q.edit_message_caption((q.message.caption or "") + "\\n⚠️ ظرفیت دوره پیش از تأیید تکمیل شده؛ کد صادر نشد.")
+            return
+        codes=[]
+        for _ in range(order["quantity"]):
+            code=unique_code(order["round_id"]); codes.append(code)
+            c.execute("INSERT INTO tickets(round_id,order_id,code,user_id,full_name,phone,created_at) VALUES(?,?,?,?,?,?,?)",
+                      (order["round_id"],oid,code,order["user_id"],order["full_name"],order["phone"],now()))
+        c.execute("UPDATE orders SET status='approved' WHERE id=?", (oid,))
+        total = c.execute("SELECT COUNT(*) n FROM tickets WHERE round_id=?", (order["round_id"],)).fetchone()["n"]
+    await context.bot.send_message(order["user_id"], "✅ پرداخت شما تأیید شد!\\n\\n"
+        f"👤 نام: {order['full_name']}\\n🎟 کدهای شما:\\n" + "\\n".join(codes))
+    await q.edit_message_caption((q.message.caption or "") + "\\n✅ تأیید شد و کد صادر شد.")
+    if total % REPORT_EVERY == 0 or (total // REPORT_EVERY > (total-order["quantity"]) // REPORT_EVERY):
+        path=create_pdf(order["round_id"])
+        with open(path,"rb") as f:
+            await context.bot.send_document(ADMIN_ID, f, filename=path,
+                caption=f"📄 گزارش دوره {order['round_id']} — {total} کد صادرشده")
 
-        if action == "approve":
-            codes = []
-            for _ in range(order["quantity"]):
-                code = make_code()
-                con.execute(
-                    "INSERT INTO tickets (order_id, user_id, code, created_at) VALUES (?, ?, ?, ?)",
-                    (order_id, order["user_id"], code, datetime.now(timezone.utc).isoformat())
-                )
-                codes.append(code)
-            con.execute("UPDATE orders SET status='approved' WHERE id=?", (order_id,))
-
-    message = (
-        f"پرداخت سفارش #{order_id} تأیید شد.\\n"
-        "کدهای شرکت در قرعه‌کشی شما:\\n" +
-        "\\n".join(codes) +
-        "\\n\\nاین کدها را تا زمان اعلام نتایج نگه دارید."
-    )
-    await context.bot.send_message(order["user_id"], message)
-    await query.edit_message_caption((query.message.caption or "") + "\\n\\nوضعیت: تأیید شد و کدها صادر شدند.")
-
-async def mycodes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with db() as con:
-        rows = con.execute(
-            "SELECT code FROM tickets WHERE user_id=? ORDER BY id DESC",
-            (update.effective_user.id,)
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("هنوز کدی برای شما صادر نشده است.")
+async def newround(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    if len(context.args) < 3:
+        await update.message.reply_text("فرمت: /newround نام_دوره ظرفیت مبلغ_پایه_تومان\\nمثال: /newround Dore2 10000 15000000")
         return
-    await update.message.reply_text("کدهای ثبت‌شده شما:\\n" + "\\n".join(r["code"] for r in rows))
+    title, cap, price = context.args[0], context.args[1], context.args[2]
+    if not cap.isdigit() or not price.isdigit() or int(cap)<1 or int(price)<1:
+        await update.message.reply_text("ظرفیت و مبلغ باید عدد مثبت باشند."); return
+    with conn() as c:
+        c.execute("UPDATE rounds SET active=0 WHERE active=1")
+        c.execute("INSERT INTO rounds(title,capacity,base_amount,active,created_at) VALUES(?,?,?,?,?)",
+                  (title.replace("_"," "),int(cap),int(price),1,now()))
+        rid=c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    await update.message.reply_text(f"✅ دوره جدید ساخته و فعال شد. شناسه: {rid}\\n{title} | ظرفیت {int(cap):,}")
 
-async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    with db() as con:
-        rows = con.execute(
-            "SELECT id, user_id, quantity, amount, status FROM orders ORDER BY id DESC LIMIT 30"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("هنوز سفارشی ثبت نشده است.")
-        return
-    lines = [
-        f"#{r['id']} | کاربر {r['user_id']} | {r['quantity']} کد | "
-        f"{r['amount']:,} تومان | {r['status']}"
-        for r in rows
-    ]
-    await update.message.reply_text("\\n".join(lines))
+async def rounds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with conn() as c: rows=c.execute("SELECT * FROM rounds ORDER BY id DESC").fetchall()
+    await update.message.reply_text("\\n\\n".join(fmt_round(r)+("\\n🟢 فعال" if r["active"] else "\\n⚪️ غیرفعال") for r in rows) or "دوره‌ای ثبت نشده.")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    with conn() as c:
+        orders=c.execute("SELECT status,COUNT(*) n FROM orders GROUP BY status").fetchall()
+        rs=c.execute("SELECT * FROM rounds ORDER BY id DESC").fetchall()
+    await update.message.reply_text("📊 وضعیت سفارش‌ها:\\n"+("\\n".join(f"{x['status']}: {x['n']}" for x in orders) or "بدون سفارش")+
+        "\\n\\n"+"\\n\\n".join(fmt_round(r) for r in rs))
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    r=active_round()
+    if context.args and context.args[0].isdigit():
+        rid=int(context.args[0])
+    elif r: rid=r["id"]
+    else:
+        await update.message.reply_text("دوره‌ای فعال نیست."); return
+    path=create_pdf(rid)
+    with open(path,"rb") as f: await update.message.reply_document(f, filename=path)
 
 def main():
+    if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
     init_db()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("buy", buy))
-    app.add_handler(CommandHandler("mycodes", mycodes))
-    app.add_handler(CommandHandler("orders", admin_orders))
-    app.add_handler(CallbackQueryHandler(admin_decision, pattern=r"^(approve|reject):"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_quantity))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_receipt))
+    app=Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("newround",newround))
+    app.add_handler(CommandHandler("rounds",rounds_cmd))
+    app.add_handler(CommandHandler("status",status_cmd))
+    app.add_handler(CommandHandler("export_pdf",export_cmd))
+    app.add_handler(CallbackQueryHandler(agree,pattern="^agree$"))
+    app.add_handler(CallbackQueryHandler(buy,pattern="^buy$"))
+    app.add_handler(CallbackQueryHandler(admin_decision,pattern="^(approve|reject):"))
+    app.add_handler(MessageHandler(filters.CONTACT,contact_handler))
+    app.add_handler(MessageHandler(filters.PHOTO,receipt_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
     print("Bot is running...")
     app.run_polling()
 

@@ -29,24 +29,68 @@ def money(n):
     return f"{int(n):,}"
 
 def init_db():
+    """Create tables and safely add columns used by this bot to older databases."""
     with conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS rounds(
             id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
             capacity INTEGER NOT NULL, base_amount INTEGER NOT NULL,
             active INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS orders(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL, username TEXT, full_name TEXT NOT NULL,
-            phone TEXT NOT NULL, quantity INTEGER NOT NULL, amount INTEGER NOT NULL UNIQUE,
-            status TEXT NOT NULL, created_at TEXT NOT NULL, receipt_file_id TEXT)""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL DEFAULT 1,
+            user_id INTEGER NOT NULL, username TEXT, full_name TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '', quantity INTEGER NOT NULL DEFAULT 1,
+            amount INTEGER NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'awaiting_receipt',
+            created_at TEXT NOT NULL DEFAULT '', receipt_file_id TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS tickets(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL,
-            order_id INTEGER NOT NULL, code TEXT NOT NULL,
-            user_id INTEGER NOT NULL, full_name TEXT NOT NULL, phone TEXT NOT NULL,
-            created_at TEXT NOT NULL, UNIQUE(round_id, code))""")
+            id INTEGER PRIMARY KEY AUTOINCREMENT, round_id INTEGER NOT NULL DEFAULT 1,
+            order_id INTEGER NOT NULL, code TEXT, user_id INTEGER NOT NULL,
+            full_name TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '', UNIQUE(round_id, code))""")
+
+        # Migrate databases created by earlier versions without deleting user data.
+        def columns(table):
+            return {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+
+        order_cols = columns("orders")
+        additions = {
+            "round_id": "INTEGER NOT NULL DEFAULT 1",
+            "quantity": "INTEGER NOT NULL DEFAULT 1",
+            "username": "TEXT",
+            "full_name": "TEXT NOT NULL DEFAULT ''",
+            "phone": "TEXT NOT NULL DEFAULT ''",
+            "receipt_file_id": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in order_cols:
+                c.execute(f"ALTER TABLE orders ADD COLUMN {name} {definition}")
+        order_cols = columns("orders")
+        if "chances" in order_cols:
+            c.execute("UPDATE orders SET quantity=chances WHERE quantity=1 AND chances IS NOT NULL")
+
+        ticket_cols = columns("tickets")
+        ticket_additions = {
+            "round_id": "INTEGER NOT NULL DEFAULT 1",
+            "code": "TEXT",
+            "user_id": "INTEGER NOT NULL DEFAULT 0",
+            "full_name": "TEXT NOT NULL DEFAULT ''",
+            "phone": "TEXT NOT NULL DEFAULT ''",
+            "created_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in ticket_additions.items():
+            if name not in ticket_cols:
+                c.execute(f"ALTER TABLE tickets ADD COLUMN {name} {definition}")
+        ticket_cols = columns("tickets")
+        if "ticket_code" in ticket_cols:
+            c.execute("UPDATE tickets SET code=ticket_code WHERE code IS NULL")
+
         if not c.execute("SELECT id FROM rounds LIMIT 1").fetchone():
             c.execute("INSERT INTO rounds(title,capacity,base_amount,active,created_at) VALUES(?,?,?,?,?)",
                       ("دوره اول", DEFAULT_CAPACITY, DEFAULT_PRICE, 1, now()))
+        # Ensure legacy rows point to an existing round.
+        first_round = c.execute("SELECT id FROM rounds ORDER BY id LIMIT 1").fetchone()["id"]
+        c.execute("UPDATE orders SET round_id=? WHERE round_id IS NULL OR round_id=0", (first_round,))
+        c.execute("UPDATE tickets SET round_id=? WHERE round_id IS NULL OR round_id=0", (first_round,))
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_round_code ON tickets(round_id, code)")
 
 def active_round():
     with conn() as c:
